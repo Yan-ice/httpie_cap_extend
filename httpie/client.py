@@ -1,9 +1,7 @@
 import argparse
 import http.client
 import json
-import os
 import sys
-from pathlib import Path
 from contextlib import contextmanager
 from time import monotonic
 from typing import Any, Dict, Callable, Iterable
@@ -16,6 +14,14 @@ from urllib3.util import SKIP_HEADER, SKIPPABLE_HEADERS
 
 from . import __version__
 from .adapters import HTTPieHTTPAdapter
+from .capability_manager import (
+    CAPABILITY_HEADER,
+    CAPABILITY_REQUIRED_SID_HEADER,
+    auto_attach_capability_header,
+    get_system_capability_dir,
+    is_retryable_request_body,
+    serialize_capability_header_from_sid,
+)
 from .cli.constants import HTTP_OPTIONS
 from .cli.dicts import HTTPHeadersDict
 from .cli.nested_json import unwrap_top_level_list_if_needed
@@ -38,9 +44,6 @@ FORM_CONTENT_TYPE = f'application/x-www-form-urlencoded; charset={UTF8}'
 JSON_CONTENT_TYPE = 'application/json'
 JSON_ACCEPT = f'{JSON_CONTENT_TYPE}, */*;q=0.5'
 DEFAULT_UA = f'HTTPie/{__version__}'
-CAPABILITY_HEADER = 'X-Capability'
-CAPABILITY_REQUIRED_SID_HEADER = 'X-Capability-Required-Sid'
-DEFAULT_SYSTEM_CAP_DIR = '~/.agent_capability'
 
 IGNORE_CONTENT_LENGTH_METHODS = frozenset([HTTP_OPTIONS])
 
@@ -128,16 +131,14 @@ def collect_messages(
                         env.log_error(
                             'Capability auto-retry failed: still forbidden after capability injection.'
                         )
-                    elif not _is_retryable_request_body(prepared_request.body):
+                    elif not is_retryable_request_body(prepared_request.body):
                         env.log_error(
                             'Capability auto-retry skipped: request body is non-rewindable.'
                         )
                     else:
-                        cap_header = _serialize_capability_header_from_sid(required_sid)
+                        cap_header = serialize_capability_header_from_sid(required_sid)
                         if cap_header is None:
-                            cap_dir = Path(
-                                os.environ.get('CAP_AGENT_SYSTEM_CAP_DIR', DEFAULT_SYSTEM_CAP_DIR)
-                            ).expanduser().resolve()
+                            cap_dir = get_system_capability_dir()
                             env.log_error(
                                 f'Capability auto-retry failed: no .cap with sid={required_sid} under {cap_dir}'
                             )
@@ -228,76 +229,6 @@ def build_requests_session(
 def dump_request(kwargs: dict):
     sys.stderr.write(
         f'\n>>> requests.request(**{repr_dict(kwargs)})\n\n')
-
-
-def _resolve_required_sid(headers: HTTPHeadersDict) -> str:
-    """
-    Resolve required capability sid from:
-    1) request hint header `X-Capability-Required-Sid`
-    2) env `CAP_REQUIRED_SID` / `HTTP_CAP_REQUIRED_SID`
-    """
-    sid = headers.get(CAPABILITY_REQUIRED_SID_HEADER)
-    if sid:
-        sid_text = str(sid).strip()
-        if sid_text:
-            return sid_text
-
-    for env_key in ('CAP_REQUIRED_SID', 'HTTP_CAP_REQUIRED_SID'):
-        sid_text = os.environ.get(env_key, '').strip()
-        if sid_text:
-            return sid_text
-    return ''
-
-
-def _load_capability_by_sid(required_sid: str, cap_dir: Path) -> Dict[str, Any] | None:
-    if not required_sid or not cap_dir.is_dir():
-        return None
-    for cap_path in sorted(cap_dir.rglob('*.cap')):
-        try:
-            data = json.loads(cap_path.read_text(encoding='utf-8'))
-            if str(data.get('sid', '')).strip() == required_sid:
-                return data
-        except Exception:
-            continue
-    return None
-
-
-def _auto_attach_capability_header(headers: HTTPHeadersDict) -> None:
-    """
-    Attach `X-Capability` header by scanning ~/.agent_capability (or env override)
-    for a .cap whose sid matches required sid.
-    """
-    if headers.get(CAPABILITY_HEADER):
-        return
-
-    required_sid = _resolve_required_sid(headers)
-    if not required_sid:
-        return
-
-    cap_dir = Path(
-        os.environ.get('CAP_AGENT_SYSTEM_CAP_DIR', DEFAULT_SYSTEM_CAP_DIR)
-    ).expanduser().resolve()
-    cap_payload = _load_capability_by_sid(required_sid, cap_dir)
-    if cap_payload is None:
-        return
-
-    headers[CAPABILITY_HEADER] = json.dumps(cap_payload, ensure_ascii=False, separators=(',', ':'))
-    if CAPABILITY_REQUIRED_SID_HEADER in headers:
-        headers.popone(CAPABILITY_REQUIRED_SID_HEADER)
-
-
-def _serialize_capability_header_from_sid(required_sid: str) -> str | None:
-    cap_dir = Path(
-        os.environ.get('CAP_AGENT_SYSTEM_CAP_DIR', DEFAULT_SYSTEM_CAP_DIR)
-    ).expanduser().resolve()
-    cap_payload = _load_capability_by_sid(required_sid, cap_dir)
-    if cap_payload is None:
-        return None
-    return json.dumps(cap_payload, ensure_ascii=False, separators=(',', ':'))
-
-
-def _is_retryable_request_body(body: Any) -> bool:
-    return body is None or isinstance(body, (bytes, str))
 
 
 def finalize_headers(headers: HTTPHeadersDict) -> HTTPHeadersDict:
@@ -455,7 +386,7 @@ def make_request_kwargs(
     if base_headers:
         headers.update(base_headers)
     headers.update(args.headers)
-    _auto_attach_capability_header(headers)
+    auto_attach_capability_header(headers)
     if args.offline and args.chunked and 'Transfer-Encoding' not in headers:
         # When online, we let requests set the header instead to be able more
         # easily verify chunking is taking place.
